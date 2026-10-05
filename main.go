@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,8 +25,6 @@ type config struct {
 	Ad3 string `json:"ad3"`
 	Ad4 string `json:"ad4"`
 }
-
-const selfPingURL = "https://xibot.onrender.com/"
 
 func getenv(key, fallback string) string {
 	if value := os.Getenv(key); value != "" {
@@ -61,30 +60,6 @@ func startHealthServer() error {
 		}
 	}()
 	return nil
-}
-
-func startSelfPing() {
-	go func() {
-		client := &http.Client{Timeout: 10 * time.Second}
-		ping := func() {
-			response, err := client.Get(selfPingURL)
-			if err != nil {
-				log.Printf("Self-ping failed: %v", err)
-				return
-			}
-			defer response.Body.Close()
-			if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-				log.Printf("Self-ping returned HTTP status %s", response.Status)
-			}
-		}
-
-		ping()
-		ticker := time.NewTicker(5 * time.Minute)
-		defer ticker.Stop()
-		for range ticker.C {
-			ping()
-		}
-	}()
 }
 
 func tokenPath() string {
@@ -198,7 +173,7 @@ func sendChat(conn *minecraft.Conn, message string) error {
 	})
 }
 
-func startAdvertisementLoop(conn *minecraft.Conn, ads []string) {
+func startAdvertisementLoop(ctx context.Context, conn *minecraft.Conn, ads []string) {
 	if len(ads) == 0 {
 		log.Println("No advertisements configured")
 		return
@@ -209,13 +184,18 @@ func startAdvertisementLoop(conn *minecraft.Conn, ads []string) {
 		defer ticker.Stop()
 
 		adIndex := 0
-		for range ticker.C {
-			if err := sendChat(conn, ads[adIndex]); err != nil {
-				log.Printf("Send advertisement failed: %v", err)
+		for {
+			select {
+			case <-ctx.Done():
 				return
+			case <-ticker.C:
+				if err := sendChat(conn, ads[adIndex]); err != nil {
+					log.Printf("Send advertisement failed: %v", err)
+					return
+				}
+				fmt.Printf("[廣告] 已發送第 %d 則\n", adIndex+1)
+				adIndex = (adIndex + 1) % len(ads)
 			}
-			fmt.Printf("[廣告] 已發送第 %d 則\n", adIndex+1)
-			adIndex = (adIndex + 1) % len(ads)
 		}
 	}()
 }
@@ -242,23 +222,18 @@ func getToken() (*oauth2.Token, error) {
 	return liveToken, nil
 }
 
-func main() {
-	if err := startHealthServer(); err != nil {
-		log.Fatalf("Start HTTP health server failed: %v", err)
-	}
-	startSelfPing()
-
+func runBot() error {
 	serverAddr := getenv("BEDROCK_SERVER", "bedrock.mcfallout.net:19132")
 	settings, err := loadConfig("config.json")
 	if err != nil {
-		log.Fatalf("Load config failed: %v", err)
+		return fmt.Errorf("load config: %w", err)
 	}
 	ads := advertisements(settings)
 
 	fmt.Println("== Bedrock Bot ==")
 	liveToken, err := getToken()
 	if err != nil {
-		log.Fatalf("Microsoft login failed: %v", err)
+		return fmt.Errorf("Microsoft login: %w", err)
 	}
 
 	dialer := minecraft.Dialer{
@@ -268,14 +243,16 @@ func main() {
 	fmt.Printf("Connecting to %s\n", serverAddr)
 	conn, err := dialer.Dial("raknet", serverAddr)
 	if err != nil {
-		log.Fatalf("Dial failed: %v", err)
+		return fmt.Errorf("dial %s: %w", serverAddr, err)
 	}
 	defer conn.Close()
 
 	if err := conn.DoSpawn(); err != nil {
-		log.Fatalf("Spawn failed: %v", err)
+		return fmt.Errorf("spawn: %w", err)
 	}
-	startAdvertisementLoop(conn, ads)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	startAdvertisementLoop(ctx, conn, ads)
 
 	fmt.Println("Connected and spawned. Type a message and press Enter to send it.")
 	go func() {
@@ -299,8 +276,7 @@ func main() {
 	for {
 		pk, err := conn.ReadPacket()
 		if err != nil {
-			log.Printf("Connection closed: %v", err)
-			return
+			return fmt.Errorf("connection closed: %w", err)
 		}
 
 		switch p := pk.(type) {
@@ -320,5 +296,19 @@ func main() {
 				fmt.Println(renderMinecraftText(p.Message))
 			}
 		}
+	}
+}
+
+func main() {
+	if err := startHealthServer(); err != nil {
+		log.Fatalf("Start HTTP health server failed: %v", err)
+	}
+
+	const retryDelay = 30 * time.Second
+	for {
+		if err := runBot(); err != nil {
+			log.Printf("Bot stopped: %v; retrying in %s", err, retryDelay)
+		}
+		time.Sleep(retryDelay)
 	}
 }
