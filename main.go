@@ -25,6 +25,8 @@ type config struct {
 	Ad4 string `json:"ad4"`
 }
 
+const selfPingURL = "https://xibot.onrender.com/"
+
 func getenv(key, fallback string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
@@ -59,6 +61,30 @@ func startHealthServer() error {
 		}
 	}()
 	return nil
+}
+
+func startSelfPing() {
+	go func() {
+		client := &http.Client{Timeout: 10 * time.Second}
+		ping := func() {
+			response, err := client.Get(selfPingURL)
+			if err != nil {
+				log.Printf("Self-ping failed: %v", err)
+				return
+			}
+			defer response.Body.Close()
+			if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+				log.Printf("Self-ping returned HTTP status %s", response.Status)
+			}
+		}
+
+		ping()
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			ping()
+		}
+	}()
 }
 
 func tokenPath() string {
@@ -220,6 +246,7 @@ func main() {
 	if err := startHealthServer(); err != nil {
 		log.Fatalf("Start HTTP health server failed: %v", err)
 	}
+	startSelfPing()
 
 	serverAddr := getenv("BEDROCK_SERVER", "bedrock.mcfallout.net:19132")
 	settings, err := loadConfig("config.json")
